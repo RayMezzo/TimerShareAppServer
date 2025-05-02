@@ -1,3 +1,5 @@
+//---サーバーサイド---
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -24,8 +26,14 @@ mongoose.connect(
 .then(() => console.log("db connected"))
 .catch((err) => console.log(err));
 
+//Mongooseをつなげるためのコード。
+//process.env.MONGODB_URIには、MongoDBに接続するためのURIが入ってる。
+//.thenは.connectが終わった後に始まる処理。
+//ちなみに.connectはPromiseを返してる。
+
 const roomTimers = {}; // { roomId: { nextTimerId: 1, timers: { [timerId]: { count, interval, note } } } }
-//roomTimersの構造
+//#region
+// roomTimersの構造
 // const roomTimers = {
 //   [roomId]: {
 //     timers: {
@@ -66,6 +74,7 @@ const roomTimers = {}; // { roomId: { nextTimerId: 1, timers: { [timerId]: { cou
 //     }
 //   }
 // }
+//#endregion
 
 
 
@@ -73,36 +82,39 @@ const roomTimers = {}; // { roomId: { nextTimerId: 1, timers: { [timerId]: { cou
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
+  //まずはio.onですべてのクライアントのデータをsocketとして取得する。
+  //socket.idはクライアントがコネクトしたときに自動的に割り振られるもので、ユニークなidが割り振られる。
+  //後々、特定のclientに対して、データを送信するなどができるようにidを割り振ってる。
+
+
+  //---ルーム参加処理----
   socket.on('join_room', async(roomId) => {
     socket.join(roomId);
     console.log(`Client ${socket.id} joined room ${roomId}`);
 
-    // ルームがまだ存在しない場合は初期化
+    //roomIdの部屋に入る。
+
     if (!roomTimers[roomId]) {
       roomTimers[roomId] = {
         nextTimerId: 1,
         timers: {},
       };
     }
-
-    // MongoDBからルームのタイマーを取得し、roomTimers[roomId]に格納する。
-    const timersFromDB = await TimerModel.find({ roomId });
-    timersFromDB.forEach(timer => {
-      roomTimers[roomId].timers[timer.timerId] = {
-        count: timer.count,
-        interval: null,
-        note: timer.note,
-      };
-    });
+    //roomTimersのなかにそのroomIdプロパティがなければ作る。
+    //ちなみに、オブジェクトのプロパティ呼び出しはroomTimers.roomIdとかでも行けると思われがちだけど、
+    //プロパティ名が変数のときはブラケット記法を使わなくてはいけないらしい。roomTimers[roomId]こういうやつ。
+    //プロパティ名が固定のときだけドット記法が使える。roomTimers.roomIdこういうやつ。
 
     // ルームに存在するタイマーの情報を送信
     const timers = roomTimers[roomId].timers;
     // 修正：循環参照のない安全なデータだけ送る
     socket.emit('all_timers', Object.entries(timers).map(([timerId, timer]) => ({
+      
       timerId,
       count: timer.count,
-      note: timer.note || '',
-      isRunning: timer.isRunning // 必要なら現在の状態も送れる
+      isRunning: timer.isRunning, // 必要なら現在の状態も送れる
+      note: timer.note || ''
+      
     })));
 
   });
@@ -140,27 +152,58 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('timer_created', { timerId, count: 0, note: '' });
   });
 
-  socket.on('resume_timer', ({ roomId, timerId }) => {
+  socket.on('resume_timer', async({ roomId, timerId }) => {
     const timer = roomTimers[roomId]?.timers[timerId];
     if (!timer || timer.interval) return;
 
+    
+
     timer.interval = setInterval(() => {
       timer.count += 0.1;
+      //console.log(`Timer ${timerId} running: ${timer.count.toFixed(1)}s`);
       io.to(roomId).emit('timer_update', { timerId, count: timer.count });
     }, 100);
+
+    
+
+    timer.isRunning = true;
+
+    // MongoDB に isRunning: true を保存
+    try {
+      await TimerModel.findOneAndUpdate(
+        { roomId, timerId },
+        { isRunning: true },
+        { upsert: true }
+      );
+      console.log(`Timer ${timerId} in room ${roomId} marked as running in DB`);
+    } catch (err) {
+      console.error(`Failed to update isRunning for timer ${timerId}:`, err);
+    }
 
     io.to(roomId).emit('timer_status', { timerId, isRunning: true });
   });
 
+
+  //--タイマーを停止する処理-----------------
   socket.on('stop_timer', async({ roomId, timerId }) => {
     const timer = roomTimers[roomId]?.timers[timerId];
-    if (!timer || !timer.interval) return;
+    if (!timer) {
+      console.log(`[stop_timer] タイマーが見つかりません: roomId=${roomId}, timerId=${timerId}`);
+      return;
+    }
+  
+    if (!timer.interval) {
+      console.log(`[stop_timer] intervalが存在しないため停止処理スキップ: roomId=${roomId}, timerId=${timerId}, isRunning=${timer.isRunning}`);
+      return;
+    }
 
     clearInterval(timer.interval);
     timer.interval = null;
+    timer.isRunning = false;
 
       // --- 追加: MongoDBに保存 ---
   try {
+    console.log(`保存直前のタイマーの値  :  ${timer.count.toFixed(1)} `);
     await TimerModel.findOneAndUpdate(
       { roomId, timerId },
       {
@@ -169,7 +212,12 @@ io.on('connection', (socket) => {
       },
       { upsert: true } // ドキュメントが無い場合は新規作成
     );
-    console.log(`Timer ${timerId} in room ${roomId} saved to DB`);
+    console.log(`タイマーが停止しました。isRunning=${timer.isRunning}`);
+    console.log(`${roomId}の${timerId} がＤＢにセーブされました。`);
+    console.log(`タイマーの値  :  ${timer.count.toFixed(1)} `);
+
+    
+
   } catch (err) {
     console.error(`Failed to save timer:`, err);
   }
